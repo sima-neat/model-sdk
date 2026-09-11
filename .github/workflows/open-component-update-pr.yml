@@ -2,125 +2,20 @@ name: Open Component Update PR
 
 on:
   workflow_run:
-    workflows:
-      - Build
-    types:
-      - completed
+    workflows: [Build]
+    types: [completed]
+    branches: [daily]
 
 permissions:
   actions: read
   contents: read
   pull-requests: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   open-pr:
-    name: Open or refresh component update PR
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'automation/component-updates' &&
       github.event.workflow_run.head_repository.full_name == github.repository
-    runs-on: ubuntu-24.04
-    concurrency:
-      group: open-model-compiler-component-update-pr
-      cancel-in-progress: true
-
-    steps:
-      - name: Create GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.NEAT_RELEASES_APP_ID }}
-          private-key: ${{ secrets.NEAT_RELEASES_APP_PRIVATE_KEY }}
-
-      # Keep privileged workflow execution on trusted default-branch code. The
-      # automation branch contributes only its source.json data below.
-      - name: Checkout trusted default-branch workflow code
-        uses: actions/checkout@v5
-        with:
-          ref: main
-          clean: true
-          fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Verify successful run is still current
-        id: verify
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: |
-          set -euo pipefail
-          current_sha="$(
-            gh api \
-              "repos/${GITHUB_REPOSITORY}/git/ref/heads/automation/component-updates" \
-              --jq '.object.sha'
-          )"
-          if [[ "${current_sha}" != "${TESTED_SHA}" ]]; then
-            echo "Tested SHA ${TESTED_SHA} is stale; current automation branch is ${current_sha}."
-            echo "current=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          git fetch origin develop
-          git fetch origin \
-            "refs/heads/automation/component-updates:refs/remotes/origin/automation/component-updates"
-          source_sha="$(git rev-parse "${TESTED_SHA}^")"
-          current_develop="$(git rev-parse origin/develop)"
-          if [[ "${source_sha}" != "${current_develop}" ]]; then
-            echo "develop advanced from ${source_sha} to ${current_develop}; waiting for a refreshed update."
-            echo "current=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          echo "current=true" >> "${GITHUB_OUTPUT}"
-
-      - name: Generate PR summary from tested manifest
-        if: steps.verify.outputs.current == 'true'
-        env:
-          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: |
-          set -euo pipefail
-          git show "origin/develop:scripts/source.json" > "${RUNNER_TEMP}/source-base.json"
-          git show "${TESTED_SHA}:scripts/source.json" > "${RUNNER_TEMP}/source-updated.json"
-          python3 scripts/update_component_versions.py summarize \
-            --base "${RUNNER_TEMP}/source-base.json" \
-            --updated "${RUNNER_TEMP}/source-updated.json" \
-            --output "${RUNNER_TEMP}/component-update-summary.md"
-
-          {
-            cat "${RUNNER_TEMP}/component-update-summary.md"
-            echo
-            echo "Validated by [Build run ${{ github.event.workflow_run.id }}](${{ github.event.workflow_run.html_url }})."
-          } > "${RUNNER_TEMP}/pr-body.md"
-
-      - name: Create or update pull request
-        if: steps.verify.outputs.current == 'true'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          branch="automation/component-updates"
-          title="Update Model Compiler component versions"
-          existing="$(
-            gh pr list \
-              --repo "${GITHUB_REPOSITORY}" \
-              --state open \
-              --base develop \
-              --head "${branch}" \
-              --json number \
-              --jq '.[0].number // empty'
-          )"
-          if [[ -n "${existing}" ]]; then
-            gh pr edit "${existing}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "${title}" \
-              --body-file "${RUNNER_TEMP}/pr-body.md"
-          else
-            gh pr create \
-              --repo "${GITHUB_REPOSITORY}" \
-              --base develop \
-              --head "${branch}" \
-              --title "${title}" \
-              --body-file "${RUNNER_TEMP}/pr-body.md"
-          fi
+    uses: sima-neat/model-compiler/.github/workflows/open-component-update-pr-worker.yml@develop
+    secrets: inherit

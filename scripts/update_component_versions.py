@@ -57,12 +57,16 @@ class UpdateError(RuntimeError):
 @dataclass(frozen=True)
 class VersionFamily:
     prefix: str
-    build: int
+    build: int | tuple[int, int]
     pattern: re.Pattern[str]
 
-    def parse_candidate(self, value: str) -> int | None:
+    def parse_candidate(self, value: str) -> int | tuple[int, int] | None:
         match = self.pattern.fullmatch(value)
-        return int(match.group("build")) if match else None
+        if match is None:
+            return None
+        if "revision" in match.groupdict():
+            return (int(match.group("revision")), int(match.group("build")))
+        return int(match.group("build"))
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,8 @@ class Component:
     kind: str
     name: str
     current: str
+    version_prefix: str | None = None
+    channel: str | None = None
 
 
 def normalize_package_name(name: str) -> str:
@@ -93,7 +99,22 @@ def python_family(version: str) -> VersionFamily | None:
     )
 
 
+def mla_release_family(prefix: str, channel: str) -> VersionFamily | None:
+    if not re.fullmatch(r"v\d+\.\d+\.\d+-", prefix) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", channel):
+        return None
+    return VersionFamily(
+        prefix, (-1, -1),
+        re.compile(rf"{re.escape(prefix)}(?P<revision>\d+)-{re.escape(channel)}\.(?P<build>\d+)"),
+    )
+
+
 def binary_family(version: str) -> VersionFamily | None:
+    release = re.fullmatch(
+        r"(?P<prefix>v\d+\.\d+\.\d+-)\d+-(?P<channel>[A-Za-z][A-Za-z0-9_-]*)\.\d+", version
+    )
+    if release:
+        family = mla_release_family(release.group("prefix"), release.group("channel"))
+        return VersionFamily(family.prefix, family.parse_candidate(version), family.pattern)
     match = BINARY_VERSION_RE.fullmatch(version)
     if not match:
         return None
@@ -105,12 +126,107 @@ def binary_family(version: str) -> VersionFamily | None:
     )
 
 
+def component_family(component: Component) -> VersionFamily:
+    parser = python_family if component.kind == "python" else binary_family
+    if component.channel is not None:
+        family = mla_release_family(component.version_prefix or "", component.channel)
+        if family is not None:
+            current_build = family.parse_candidate(component.current)
+            family = VersionFamily(
+                family.prefix, (-1, -1) if current_build is None else current_build, family.pattern
+            )
+    elif component.version_prefix is None:
+        family = parser(component.current)
+    else:
+        family = parser(component.version_prefix + "0")
+        if family is not None:
+            current_build = family.parse_candidate(component.current)
+            if current_build is None:
+                current_build = (-1, -1) if isinstance(family.build, tuple) else -1
+            family = VersionFamily(family.prefix, current_build, family.pattern)
+    if family is None:
+        raise UpdateError(f"invalid version prefix for {component.name}")
+    return family
+
+
+def policy_label(component: Component) -> str:
+    family = component_family(component)
+    if component.channel is not None:
+        return f"{family.prefix}*-{component.channel}.*"
+    return f"{family.prefix}*"
+
+
+def update_policy(doc: dict[str, Any]) -> dict[tuple[str, str], tuple[str, str | None]] | None:
+    """Absent policy preserves legacy pin-derived behavior; an empty policy manages none."""
+    if "component-updates" not in doc:
+        return None
+    policy = doc["component-updates"]
+    if not isinstance(policy, dict) or set(policy) - {"python-packages", "binary-packages"}:
+        raise UpdateError("invalid component-updates configuration")
+    result = {}
+    for section, kind, parser in (
+        ("python-packages", "python", python_family),
+        ("binary-packages", "binary", binary_family),
+    ):
+        entries = policy.get(section, {})
+        if not isinstance(entries, dict):
+            raise UpdateError(f"component-updates.{section} must be an object")
+        for name, entry in entries.items():
+            if not isinstance(entry, dict) or set(entry) not in ({"version-prefix"}, {"version-prefix", "channel"}):
+                raise UpdateError(f"{name}: expected version-prefix and optional binary channel")
+            prefix = entry["version-prefix"]
+            channel = entry.get("channel")
+            if "channel" in entry:
+                valid = (
+                    kind == "binary" and name.strip("/") == "mla/toolchain/mla-toolchain"
+                    and isinstance(prefix, str) and isinstance(channel, str)
+                    and mla_release_family(prefix, channel) is not None
+                )
+            else:
+                valid = isinstance(prefix, str) and prefix.endswith(".") and parser(prefix + "0") is not None
+            if not valid:
+                raise UpdateError(f"{name}: invalid version-prefix/channel {entry!r}")
+            normalized = normalize_package_name(name) if kind == "python" else name.strip("/")
+            key = (kind, normalized)
+            if key in result:
+                raise UpdateError(f"duplicate update policy for {normalized}")
+            result[key] = (prefix, channel)
+    return result
+
+
+def validate_manifest_policy(doc: dict[str, Any]) -> None:
+    policy = update_policy(doc)
+    if policy is None:
+        return
+    seen: dict[tuple[str, str], set[str]] = {}
+    sections = [doc] + [doc[a] for a in SUPPORTED_ARCHES if isinstance(doc.get(a), dict)]
+    for section in sections:
+        for name, version in section.get("dependency_overrides", {}).items():
+            seen.setdefault(("python", normalize_package_name(name)), set()).add(version)
+        for field, kind in (("python-packages", "python"), ("binary-packages", "binary")):
+            for item in section.get(field, []):
+                if not isinstance(item, dict) or "version" not in item or "url" in item or "file" in item:
+                    continue
+                name = normalize_package_name(item["name"]) if kind == "python" else item["name"].strip("/")
+                seen.setdefault((kind, name), set()).add(item["version"])
+    for key in policy:
+        versions = seen.get(key, set())
+        if not versions:
+            raise UpdateError(f"update policy has no editable pin for {key[1]}")
+        if len(versions) != 1:
+            raise UpdateError(f"conflicting duplicate pins for {key[1]}")
+        parser = python_family if key[0] == "python" else binary_family
+        if parser(next(iter(versions))) is None:
+            raise UpdateError(f"unsupported current version for {key[1]}")
+
+
 def effective_doc(doc: dict[str, Any], target_arch: str) -> dict[str, Any]:
     arch_doc = doc.get(target_arch)
     return arch_doc if isinstance(arch_doc, dict) else doc
 
 
 def collect_components(doc: dict[str, Any], target_arch: str) -> list[Component]:
+    validate_manifest_policy(doc)
     selected = effective_doc(doc, target_arch)
     components: dict[str, Component] = {}
 
@@ -181,11 +297,17 @@ def collect_components(doc: dict[str, Any], target_arch: str) -> list[Component]
             )
             components[component.component_id] = component
 
+    policy = update_policy(doc)
+    if policy is not None:
+        components = {
+            key: Component(c.component_id, c.kind, c.name, c.current, *policy[(c.kind, c.name)])
+            for key, c in components.items() if (c.kind, c.name) in policy
+        }
     return sorted(components.values(), key=lambda item: item.component_id)
 
 
 def curl_text(url: str, *, head: bool = False) -> str:
-    command = ["curl", "-fsSL", "--netrc-optional"]
+    command = ["curl", "-fsSL", "--netrc-optional", "--connect-timeout", "15", "--max-time", "120"]
     if head:
         command.extend(["--head", "--output", "/dev/null"])
     command.append(url)
@@ -200,14 +322,15 @@ def python_index_versions(
     package: str,
     current: str,
     index_url: str,
+    family: VersionFamily | None = None,
 ) -> list[str]:
-    family = python_family(current)
+    family = family or python_family(current)
     if family is None:
         return []
     package_url = f"{index_url.rstrip('/')}/{normalize_package_name(package)}/"
     page = urllib.parse.unquote(html.unescape(curl_text(package_url)))
     page_pattern = re.compile(
-        rf"{re.escape(family.prefix)}(?P<build>\d+)"
+        rf"(?<![A-Za-z0-9.]){re.escape(family.prefix)}(?P<build>\d+)(?=[-\"<>\s]|$)"
     )
     matches = {
         match.group(0)
@@ -258,7 +381,19 @@ def wheel_is_available(
             ]
         )
         result = subprocess.run(command, text=True, capture_output=True)
-        return result.returncode == 0
+        if result.returncode == 0:
+            return True
+        # Only an ordinary missing compatible distribution is a negative result.
+        # Authentication, retries, and transport failures must fail the scan.
+        diagnostic = result.stdout + result.stderr
+        missing = "No matching distribution found" in diagnostic
+        infrastructure = any(marker in diagnostic for marker in (
+            "Retrying", "401", "403", "ConnectionError", "SSLError",
+            "ReadTimeout", "Could not fetch URL", "Traceback",
+        ))
+        if missing and not infrastructure:
+            return False
+        raise UpdateError(f"wheel availability check failed for {package}=={version}; check index access")
 
 
 def binary_index_versions(
@@ -267,7 +402,7 @@ def binary_index_versions(
     target_arch: str,
     artifactory_url: str,
 ) -> list[str]:
-    family = binary_family(component.current)
+    family = component_family(component)
     if family is None:
         return []
     parent, _, leaf = component.name.rpartition("/")
@@ -290,7 +425,7 @@ def binary_index_versions(
 
     archive_suffix = MLA_ARCH_SUFFIX[target_arch]
     filename_re = re.compile(
-        rf"^/?{re.escape(leaf)}-(?P<version>{re.escape(family.prefix)}\d+)"
+        rf"^/?{re.escape(leaf)}-(?P<version>.+)"
         rf"-{re.escape(archive_suffix)}-ubuntu\.(?:zip)$"
     )
     versions = set()
@@ -320,6 +455,7 @@ def scan(
     index_url: str,
     artifactory_url: str,
     max_candidates: int,
+    newest_only: bool = False,
 ) -> None:
     doc = json.loads(source_json.read_text(encoding="utf-8"))
     python_version = re.sub(
@@ -335,21 +471,22 @@ def scan(
     for component in collect_components(doc, target_arch):
         if component.kind == "python":
             candidates = python_index_versions(
-                component.name, component.current, index_url
+                component.name, component.current, index_url, component_family(component)
             )
             if max_candidates > 0:
                 candidates = candidates[:max_candidates]
-            available = [
-                version
-                for version in candidates
+            available = []
+            for version in candidates:
                 if wheel_is_available(
                     component.name,
                     version,
                     target_arch=target_arch,
                     python_version=python_version,
                     index_url=index_url,
-                )
-            ]
+                ):
+                    available.append(version)
+                    if newest_only:
+                        break
         else:
             available = binary_index_versions(
                 component,
@@ -362,6 +499,12 @@ def scan(
             "kind": component.kind,
             "name": component.name,
             "current": component.current,
+            "version_prefix": component_family(component).prefix,
+            "channel": component.channel,
+            "coordinate": (
+                f"{index_url.rstrip('/')}/{component.name}/" if component.kind == "python"
+                else f"{artifactory_url.rstrip('/')}/{component.name}"
+            ),
             "available": available,
         }
         newest = available[0] if available else "none"
@@ -406,6 +549,8 @@ def component_version_paths(
                         and isinstance(item.get("name"), str)
                         and normalize_package_name(item["name"]) == component.name
                         and item.get("version") == component.current
+                        and not isinstance(item.get("url"), str)
+                        and not isinstance(item.get("file"), str)
                     ):
                         paths.add(
                             section_path + ("python-packages", index, "version")
@@ -419,6 +564,8 @@ def component_version_paths(
                         and isinstance(item.get("name"), str)
                         and item["name"].strip().strip("/") == component.name
                         and item.get("version") == component.current
+                        and not isinstance(item.get("url"), str)
+                        and not isinstance(item.get("file"), str)
                     ):
                         paths.add(
                             section_path + ("binary-packages", index, "version")
@@ -526,18 +673,14 @@ def select_updates(
         common = set(entries[0].get("available", []))
         for entry in entries[1:]:
             common.intersection_update(entry.get("available", []))
-        family = (
-            python_family(component.current)
-            if component.kind == "python"
-            else binary_family(component.current)
-        )
+        family = component_family(component)
         if family is None:
             continue
         eligible = [
             value
             for value in common
             if family.parse_candidate(value) is not None
-            and (family.parse_candidate(value) or -1) > family.build
+            and family.parse_candidate(value) > family.build
         ]
         if eligible:
             updates[component_id] = max(
@@ -628,14 +771,14 @@ def merge(
     if updates:
         lines.extend(
             [
-                "| Component | Previous | Updated |",
-                "|---|---:|---:|",
+                "| Component | Previous | Updated | Update prefix |",
+                "|---|---|---|---|",
             ]
         )
         for component_id, new_version in sorted(updates.items()):
             component = components[component_id]
             lines.append(
-                f"| `{component.name}` | `{component.current}` | `{new_version}` |"
+                f"| `{component.name}` | `{component.current}` | `{new_version}` | `{policy_label(component)}` |"
             )
     else:
         lines.append("No newer builds were available in the currently pinned version families.")
@@ -659,15 +802,35 @@ def summarize(base: Path, updated: Path, output: Path) -> None:
     lines = [
         "## Component version updates",
         "",
-        "| Component | Previous | Updated |",
-        "|---|---:|---:|",
+        "| Component | Previous | Updated | Update prefix |",
+        "|---|---|---|---|",
     ]
     changes = 0
     for key, old_version in sorted(base_components.items()):
         new_version = updated_components.get(key)
         if new_version and new_version != old_version:
-            lines.append(f"| `{key[1]}` | `{old_version}` | `{new_version}` |")
+            component = next(
+                c for c in collect_components(base_doc, "aarch64") + collect_components(base_doc, "x86_64")
+                if (c.kind, c.name) == key
+            )
+            family = component_family(component)
+            build = family.parse_candidate(new_version)
+            if build is None or build <= family.build:
+                raise UpdateError(f"candidate violates update policy for {key[1]}")
+            lines.append(f"| `{key[1]}` | `{old_version}` | `{new_version}` | `{policy_label(component)}` |")
             changes += 1
+    components = {
+        c.component_id: c for arch in SUPPORTED_ARCHES for c in collect_components(base_doc, arch)
+    }
+    updates = {
+        c.component_id: updated_components[(c.kind, c.name)] for c in components.values()
+        if updated_components.get((c.kind, c.name), c.current) != c.current
+    }
+    expected = json.loads(apply_updates_preserving_format(
+        base.read_text(encoding="utf-8"), base_doc, components, updates,
+    ))
+    if expected != updated_doc:
+        raise UpdateError("candidate changes fields outside managed version pins")
     if not changes:
         raise UpdateError("automation branch contains no managed component updates")
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -678,6 +841,7 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     scan_parser = subparsers.add_parser("scan")
+    scan_parser.add_argument("--newest-only", action="store_true", help="Stop at the newest compatible wheel; use for single-architecture reports")
     scan_parser.add_argument("--source-json", type=Path, required=True)
     scan_parser.add_argument("--target-arch", choices=SUPPORTED_ARCHES, required=True)
     scan_parser.add_argument("--output", type=Path, required=True)
@@ -721,6 +885,7 @@ def main() -> int:
                 index_url=args.index_url,
                 artifactory_url=args.artifactory_url,
                 max_candidates=args.max_candidates,
+                newest_only=args.newest_only,
             )
         elif args.command == "merge":
             changed = merge(

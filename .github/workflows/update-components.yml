@@ -1,181 +1,27 @@
 name: Daily Component Update
 
-run-name: Check source.json component families for newer builds
-
 on:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "17 */4 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Report available updates without pushing the automation branch
+        description: Report available updates without changing daily
         type: boolean
         default: false
+      source_ref:
+        description: Manifest ref for dry-run testing only
+        type: string
+        default: develop
 
 permissions:
   actions: write
   contents: write
 
-concurrency:
-  group: model-compiler-component-updates
-  cancel-in-progress: false
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
-  resolve-source:
-    name: Resolve develop source commit
-    runs-on: ubuntu-24.04
-    outputs:
-      sha: ${{ steps.source.outputs.sha }}
-
-    steps:
-      - name: Checkout develop
-        uses: actions/checkout@v5
-        with:
-          ref: develop
-          clean: true
-
-      - name: Record source commit
-        id: source
-        run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
-
-  scan:
-    name: Scan ARM64 component artifacts
-    needs: resolve-source
-    runs-on:
-      - self-hosted
-      - macOS
-      - ARM64
-      - osx
-
-    steps:
-      - name: Checkout develop
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.resolve-source.outputs.sha }}
-          clean: true
-
-      - name: Checkout updater implementation
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: _component-updater
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Upgrade pip
-        run: python3 -m pip install --upgrade pip
-
-      - name: Scan compatible component builds
-        run: |
-          set -euo pipefail
-          python3 _component-updater/scripts/update_component_versions.py scan \
-            --source-json scripts/source.json \
-            --target-arch aarch64 \
-            --output scan-aarch64.json
-
-      - name: Upload scan report
-        uses: actions/upload-artifact@v7
-        with:
-          name: component-scan-aarch64
-          path: scan-aarch64.json
-          if-no-files-found: error
-          retention-days: 3
-
-  prepare-update:
-    name: Prepare source.json update
-    needs:
-      - resolve-source
-      - scan
-    runs-on: ubuntu-24.04
-    outputs:
-      changed: ${{ steps.merge.outputs.changed }}
-
-    steps:
-      - name: Checkout develop
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ needs.resolve-source.outputs.sha }}
-          clean: true
-          fetch-depth: 0
-
-      - name: Checkout updater implementation
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: _component-updater
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Download architecture scan reports
-        uses: actions/download-artifact@v7
-        with:
-          name: component-scan-aarch64
-          path: _component-scans
-
-      - name: Merge compatible versions
-        id: merge
-        run: |
-          set -euo pipefail
-          python3 _component-updater/scripts/update_component_versions.py merge \
-            --source-json scripts/source.json \
-            --report _component-scans/scan-aarch64.json \
-            --output "${RUNNER_TEMP}/source.json" \
-            --summary "${RUNNER_TEMP}/component-update-summary.md" \
-            --github-output "${GITHUB_OUTPUT}"
-          cp "${RUNNER_TEMP}/source.json" scripts/source.json
-          cat "${RUNNER_TEMP}/component-update-summary.md" >> "${GITHUB_STEP_SUMMARY}"
-          python3 -m json.tool scripts/source.json >/dev/null
-          python3 -m unittest \
-            _component-updater/tests/test_update_component_versions.py -v
-
-      - name: Show dry-run diff
-        if: steps.merge.outputs.changed == 'true' && github.event_name == 'workflow_dispatch' && inputs.dry_run
-        run: git diff -- scripts/source.json
-
-      - name: Create GitHub App token
-        if: steps.merge.outputs.changed == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.NEAT_RELEASES_APP_ID }}
-          private-key: ${{ secrets.NEAT_RELEASES_APP_PRIVATE_KEY }}
-
-      - name: Refresh stable automation branch
-        if: steps.merge.outputs.changed == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
-        env:
-          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
-          SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
-        run: |
-          set -euo pipefail
-
-          branch="automation/component-updates"
-          git fetch origin develop
-          current_develop="$(git rev-parse origin/develop)"
-          if [[ "${current_develop}" != "${SOURCE_SHA}" ]]; then
-            echo "develop advanced from ${SOURCE_SHA} to ${current_develop}; refusing a stale update." >&2
-            exit 1
-          fi
-
-          git config user.name "neat-releases[bot]"
-          git config user.email "neat-releases[bot]@users.noreply.github.com"
-          git switch -C "${branch}"
-          git add scripts/source.json
-          git commit -m "Update Model Compiler component versions"
-
-          git remote set-url origin \
-            "https://x-access-token:${GH_APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git fetch origin "refs/heads/${branch}:refs/remotes/origin/${branch}" || true
-          git push --force-with-lease origin "HEAD:refs/heads/${branch}"
-
-      - name: Report no changes
-        if: steps.merge.outputs.changed != 'true'
-        run: echo "No newer common component builds were found." >> "${GITHUB_STEP_SUMMARY}"
+  update:
+    uses: sima-neat/model-compiler/.github/workflows/update-components-worker.yml@develop
+    with:
+      dry_run: ${{ inputs.dry_run || false }}
+      source_ref: ${{ inputs.source_ref || 'develop' }}
+    secrets: inherit

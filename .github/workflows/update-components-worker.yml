@@ -1,0 +1,182 @@
+name: Daily Component Update
+
+run-name: Check source.json component families for newer builds
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+      source_ref:
+        type: string
+        default: develop
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: model-compiler-component-updates
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  resolve-source:
+    name: Resolve develop source commit
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+
+    steps:
+      - name: Validate source selection
+        env:
+          SOURCE_REF: ${{ inputs.source_ref || 'develop' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          if [[ "${SOURCE_REF}" != "develop" && "${DRY_RUN}" != "true" ]]; then
+            echo "A custom source_ref requires dry_run=true." >&2
+            exit 1
+          fi
+
+      - name: Checkout develop
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_ref || 'develop' }}
+          clean: true
+
+      - name: Record source commit
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+  scan:
+    name: Scan ARM64 component artifacts
+    needs: resolve-source
+    runs-on:
+      - self-hosted
+      - macOS
+      - ARM64
+      - osx
+
+    steps:
+      - name: Checkout develop
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          clean: true
+
+      - name: Checkout updater implementation
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          path: _component-updater
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip
+        run: python3 -m pip install --upgrade pip
+
+      - name: Scan compatible component builds
+        run: |
+          set -euo pipefail
+          python3 _component-updater/scripts/update_component_versions.py scan \
+            --source-json scripts/source.json \
+            --target-arch aarch64 --newest-only \
+            --output scan-aarch64.json
+
+      - name: Upload scan report
+        uses: actions/upload-artifact@v7
+        with:
+          name: component-scan-aarch64
+          path: scan-aarch64.json
+          if-no-files-found: error
+          retention-days: 3
+
+  prepare-update:
+    name: Prepare source.json update
+    needs:
+      - resolve-source
+      - scan
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+
+    steps:
+      - name: Checkout develop
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          clean: true
+          fetch-depth: 0
+
+      - name: Checkout updater implementation
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          path: _component-updater
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Download architecture scan reports
+        uses: actions/download-artifact@v7
+        with:
+          name: component-scan-aarch64
+          path: _component-scans
+
+      - name: Merge compatible versions
+        id: merge
+        run: |
+          set -euo pipefail
+          python3 _component-updater/scripts/update_component_versions.py merge \
+            --source-json scripts/source.json \
+            --report _component-scans/scan-aarch64.json \
+            --output "${RUNNER_TEMP}/source.json" \
+            --summary "${RUNNER_TEMP}/component-update-summary.md" \
+            --github-output "${GITHUB_OUTPUT}"
+          cp "${RUNNER_TEMP}/source.json" scripts/source.json
+          cat "${RUNNER_TEMP}/component-update-summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          python3 -m json.tool scripts/source.json >/dev/null
+          python3 -m unittest discover -s _component-updater/tests -p 'test*component*.py' -v
+
+      - name: Show dry-run diff
+        if: steps.merge.outputs.changed == 'true' && inputs.dry_run
+        run: git diff -- scripts/source.json
+
+      - name: Create GitHub App token
+        if: ${{ !inputs.dry_run }}
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.NEAT_RELEASES_APP_ID }}
+          private-key: ${{ secrets.NEAT_RELEASES_APP_PRIVATE_KEY }}
+
+      - name: Refresh stable automation branch
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # checkout@v5 persists GITHUB_TOKEN in this header. Replace it for
+          # this process so the App-authenticated push triggers Build.
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0=
+          export GIT_CONFIG_KEY_1=http.https://github.com/.extraheader
+          GIT_CONFIG_VALUE_1="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_APP_TOKEN}" | base64 | tr -d '\n')"
+          export GIT_CONFIG_VALUE_1
+          echo "::add-mask::${GIT_CONFIG_VALUE_1}"
+          bash _component-updater/scripts/refresh_daily_branch.sh
+
+      - name: Report no changes
+        if: steps.merge.outputs.changed != 'true'
+        run: echo "No newer component builds matched the update policy." >> "${GITHUB_STEP_SUMMARY}"

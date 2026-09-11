@@ -29,7 +29,7 @@ import dataclasses
 # SiMa Model Compiler Imports
 from afe.apis.defines import (
     default_quantization, quantization_scheme,
-    RequantizationMode, CalibrationMethod, gen2_target,gen1_target, bfloat16_scheme,
+    RequantizationMode, CalibrationMethod, bfloat16_scheme,
     TensorTessellateParameters, TensorDRAMLayout, InputName
 )
 from afe.load.importers.general_importer import ImporterParams, ModelFormat
@@ -59,6 +59,24 @@ logger = PrintLogger()
 _ONNX_IR_VERSION = 8
 _ONNX_OPSET_VERSION = 17
 DIVIDER = "-" * 60
+
+
+def resolve_target(device):
+    """Resolve only the requested target; newer SDKs no longer expose Gen1."""
+    from afe.apis import defines
+
+    if device == "modalix":
+        return defines.gen2_target
+    if device == "mlsoc":
+        target = getattr(defines, "gen1_target", None)
+        if target is None:
+            raise ValueError(
+                "The installed Model SDK does not support the deprecated MLSoC "
+                "(Gen1) target. Use --device modalix for Modalix hardware, or "
+                "install an SDK that supports MLSoC."
+            )
+        return target
+    raise ValueError(f"Unsupported device: {device}")
 
 
 def build_quantization_manifest(*, bf16_activations, bf16_weights, device):
@@ -255,6 +273,7 @@ class ModelProcessor:
         return convert_data_generator_to_iterable(DataGenerator(inputs_dict))
 
     def run(self):
+        target_device = resolve_target(self.args.device)
         model_path = self.args.model_path
         if self.args.model_format == 'onnx' and self.args.simplify:
             model_path = self.prepare_onnx()
@@ -282,7 +301,6 @@ class ModelProcessor:
             output_names=output_names
         )
         
-        target_device = gen2_target if self.args.device == "modalix" else gen1_target
         loaded_net = load_model(importer_params, target=target_device)
         logger.info(f"Model successfully loaded for {self.args.device}")
 

@@ -1,0 +1,43 @@
+name: Daily Build Slack Notification
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  notify:
+    if: github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted notification code
+        uses: actions/checkout@v5
+        with:
+          ref: develop
+          sparse-checkout: scripts/daily_build_notification.py
+          sparse-checkout-cone-mode: false
+
+      - name: Compose daily build result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          CHANNEL_ID: ${{ vars.SLACK_VULCAN_EVENT_CHANNEL_ID }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs?filter=latest&per_page=100" \
+            > "${RUNNER_TEMP}/jobs.json"
+          python3 scripts/daily_build_notification.py \
+            --event "${GITHUB_EVENT_PATH}" --jobs "${RUNNER_TEMP}/jobs.json" \
+            --channel "${CHANNEL_ID}" --output "${RUNNER_TEMP}/slack-payload.json"
+
+      - name: Notify neat-vulcan-events
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
+        with:
+          errors: true
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload-file-path: ${{ runner.temp }}/slack-payload.json

@@ -42,7 +42,7 @@ jobs:
               - self-hosted
               - Linux
               - X64
-              - issue-triage
+              - bridge
           - arch: arm64
             target_arch: aarch64
             runner:
@@ -114,6 +114,9 @@ jobs:
           echo "Resolved bundle version: ${version}"
 
       - name: Build package
+        env:
+          # pip stages multi-GB dependencies; /tmp may be a small tmpfs.
+          TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
           scripts/build_modelsdk_bundle.sh \
@@ -122,6 +125,9 @@ jobs:
             --output-dir "dist/${{ matrix.arch }}/package" \
             --bundle-version "${{ steps.version.outputs.version }}" \
             --prod
+
+      - name: Report resolved component versions
+        run: cat "dist/${{ matrix.arch }}/package/component-versions.md" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Validate package
         run: |

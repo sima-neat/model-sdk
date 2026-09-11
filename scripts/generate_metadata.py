@@ -6,6 +6,8 @@ from pathlib import Path
 import shlex
 import zipfile
 
+from component_inventory import inventory, summary
+
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -138,6 +140,10 @@ def main() -> int:
     if not package_artifacts:
         raise SystemExit(f"No wheel or source package artifacts found in {artifacts_dir}")
 
+    component_versions = inventory(
+        artifacts, json.loads(source_manifest.read_text()) if source_manifest.is_file() else {}, args.target_arch
+    )
+
     installer = artifacts_dir / args.installer_script
     if not installer.is_file():
         raise SystemExit(
@@ -227,6 +233,14 @@ def main() -> int:
         if not isinstance(resolved_packages, dict):
             raise SystemExit("Resolved package provenance must be a JSON object")
         metadata["resolved-packages"] = resolved_packages
+    metadata["component-versions"] = component_versions
+    (artifacts_dir / "component-versions.json").write_text(
+        json.dumps(component_versions, indent=2) + "\n", encoding="utf-8"
+    )
+    (artifacts_dir / "component-versions.md").write_text(
+        summary(component_versions, version=args.version, arch=args.target_arch,
+                provenance=metadata.get("resolved-packages", {})), encoding="utf-8"
+    )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")

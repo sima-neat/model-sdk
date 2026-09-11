@@ -99,27 +99,66 @@ resource-constrained machines.
 
 ### Automated component updates
 
-The `Daily Component Update` workflow checks `scripts/source.json` every
-day at 00:00 UTC. The current version is the update policy: for example,
-`2.1.3.dev0+master.390` can advance only within
-`2.1.3.dev0+master.*`, and `v2.1.3560-develop.409` can advance only within
-`v2.1.3560-develop.*`. Changing a base version or channel remains a manual
-manifest change.
+The `Daily Component Update` workflow checks `develop`'s `scripts/source.json`
+every four hours (00:17, 04:17, 08:17, 12:17, 16:17, and 20:17 UTC).
+A small `Daily Component Update` wrapper on the default branch calls the
+updater workflow on `develop`; updater scripts and the manifest are checked out
+from the same resolved `develop` commit. GitHub may delay scheduled runs.
+Exact versions remain the build inputs. The optional
+`component-updates` block explicitly lists packages managed by automation:
 
-The private macOS/ARM64 runner validates available artifacts and acts as the
-authoritative scanner because Artifactory publishes matching component
-versions for ARM64 and amd64. Changed manifests refresh the stable
-`automation/component-updates` branch from the tested `develop` commit. The
-ordinary Build workflow still packages and tests both architectures. A
-successful Build run for that exact branch commit creates or updates one pull
-request back to `develop`.
+```json
+"component-updates": {
+  "python-packages": {
+    "sima-frontend": {"version-prefix": "3.0.0.dev0+develop."}
+  },
+  "binary-packages": {
+    "mla/toolchain/mla-toolchain": {
+      "version-prefix": "v3.0.0-",
+      "channel": "develop"
+    }
+  }
+}
+```
 
-Manual dry runs are available through `workflow_dispatch`. Branch pushes use
-the `NEAT_RELEASES_APP_ID` and `NEAT_RELEASES_APP_PRIVATE_KEY` secrets so the
-push triggers the Build workflow. GitHub executes scheduled and
-`workflow_run` workflows from the repository default branch, so both
-automation workflow files must be present on `main` before unattended runs
-and automatic PR creation become active.
+The scanner chooses the greatest numeric build suffix in that exact prefix.
+A prefix may differ from the current pin, explicitly authorizing the initial
+base/channel transition. Subsequent runs advance only within that prefix.
+Editing an exact pin does not change the configured prefix. Different components
+may use different base versions. Package names are normalized, and matching
+pins in `dependency_overrides` and `python-packages` update together.
+URL/file-pinned packages are excluded. Conflicting duplicate pins are rejected.
+
+Only listed components are managed when the block is present; an empty block
+manages none. Older manifests without the block retain pin-derived discovery.
+The supplied policy manages ten Python packages and the MLA toolchain. Moving
+LLiMa snap references are not included. MLA uses `version-prefix` for the release
+and `channel` for the branch: `v3.0.0-` plus `develop` matches
+`v3.0.0-3609-develop.453`. Discovery orders the numeric revision first, then the
+numeric channel build, allowing both to advance within 3.0.0 develop. Other
+releases, PRs, and commit-only archives are excluded. An explicit policy allows
+migration from a legacy 2.1 pin. Legacy binary prefixes ending in `.` retain
+their existing suffix-only behavior. Architecture scans select only matching
+`x86` or `aarch64` Ubuntu ZIPs; merging two scans requires a common version.
+
+The private macOS/ARM64 runner checks Python 3.12 ARM64 or universal wheels.
+A changed candidate refreshes `daily` from the scanned `develop` commit using
+an explicit force-with-lease. Identical existing candidates
+leave the branch untouched. A new develop commit refreshes daily even if no
+package pins changed, so code and bundle-version changes are included. GitHub App credentials trigger the ordinary Build,
+which packages, installs, and smoke-tests both architectures. These tests gate
+cross-component compatibility; individual artifact availability does not.
+A successful current manifest-only updater commit opens or refreshes one PR
+from `daily` to `develop`, with old/new versions, prefixes and the Build link.
+
+Manual dry runs are available through `workflow_dispatch`. The optional
+`source_ref` input can select a feature-branch manifest only with `dry_run=true`;
+normal updates always read `develop`. Artifactory access
+uses the private runner's existing netrc credentials. Pushes use
+`NEAT_RELEASES_APP_ID` and `NEAT_RELEASES_APP_PRIVATE_KEY`.
+GitHub executes scheduled and `workflow_run` workflows from the default branch:
+deploy the workflow and helper changes to `main`, and the policy to `develop`,
+before unattended updates can use the new configuration.
 
 ## Building a Bundle
 
@@ -519,3 +558,32 @@ This repository currently focuses on:
 
 If you add more extensions later, use the existing extension-style install root
 under `sdk-extensions/`.
+
+
+### Build component metadata and daily notifications
+
+Every architecture's Build summary lists the actual selected SiMa component
+versions, including MLA, and an expandable table of all other bundled packages.
+The inventory is derived from downloaded artifact filenames, not just requested
+pins. `component-versions.json` and `component-versions.md` are included in the
+build artifacts; the same inventory is stored in `metadata.json` and
+`metadata-offline.json` under `component-versions`. LLiMa's resolved commit is
+reported separately.
+
+Completed `daily` Build runs report success or failure (including cancellation)
+to `neat-vulcan-events`, using the organization's `SLACK_BOT_TOKEN` secret and
+`SLACK_VULCAN_EVENT_CHANNEL_ID` variable. Notifications link to the build and its
+component tables. The completion listener must exist on default branch `main`;
+it calls the protected develop worker and executes trusted notification code
+from develop, never code from a build artifact. Feature-branch and develop builds do not send these notifications.
+
+The periodic updater only rebuilds when the resolved candidate or develop
+commit changes. To repeat validation of an unchanged candidate, manually run
+Build on `daily`. The test-only `codex/daily-component-updates-e2e` branch is no
+longer the publication target.
+
+The three default-branch entry points (`update-components.yml`,
+`daily-build-notify.yml`, and `open-component-update-pr.yml`) are kept in one
+isolated commit: merge into develop first, then cherry-pick that commit onto
+main. Each entry point calls its corresponding `*-worker.yml@develop`. Worker
+logic and helper scripts are maintained only on develop for this rollout.
